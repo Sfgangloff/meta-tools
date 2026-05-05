@@ -128,5 +128,9 @@ def _load_generated_tools() -> int:
 _load_generated_tools()
 
 
-if __name__ == "__main__":
+def main() -> None:
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
