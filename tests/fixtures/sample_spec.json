@@ -1,0 +1,26 @@
+{
+  "description": "A simple, well-defined spec for testing develop_tool end-to-end",
+  "spec": {
+    "name": "word_frequency_counter",
+    "one_liner": "Count word occurrences in a text file and return the top-N most common words",
+    "rationale": "A focused, low-risk spec good for exercising code generation and the safety gate.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to the text file"
+        },
+        "top_n": {
+          "type": "integer",
+          "description": "Number of most-common words to return",
+          "default": 10
+        }
+      },
+      "required": ["file_path"]
+    },
+    "output_description": "A dict with 'words' (list of {word, count} objects) and 'total_words' (int).",
+    "implementation_approach": "Read the file, lowercase and split on non-word characters using re.split, count with collections.Counter, return the top_n most common as a list of dicts.",
+    "effort_estimate": "low"
+  }
+}

@@ -1,0 +1,765 @@
+================================================================================
+META-TOOLS — PROJECT PLAN
+================================================================================
+Project: meta-tools — an MCP server for Claude Code
+Goal:    A self-extending, self-managing tool system. Phases 1–4 give Claude
+         the ability to detect missing tools and build them. Phase 5+ add a
+         shelf-management layer so a large library of tools can be maintained
+         without overwhelming Claude's context: only a bounded working set is
+         exposed at any time, and Claude can swap tools in and out on demand.
+Date:    2026-04-30 (initial), updated 2026-05-04
+================================================================================
+
+
+1. CONCEPT & MOTIVATION
+--------------------------------------------------------------------------------
+Claude Code operates with a fixed toolset. When Claude encounters a gap —
+something it cannot do in one step that should be one step — it currently has
+no recourse except workarounds. This project closes that loop:
+
+  Observe friction → Confirm gap with high confidence → Write the tool →
+  Register it live → Use it now
+
+The key constraint is confidence. The system must be conservative: it should
+almost never trigger a suggestion. A false positive (building a tool that
+doesn't actually help, or that reimplements something that exists) wastes
+time and pollutes the toolset. The bar is "I am almost certain this tool
+would be used right now and multiple times in the future."
+
+This is not a brainstorming tool. It is a last-resort self-extension
+mechanism.
+
+
+2. THE FULL LOOP
+--------------------------------------------------------------------------------
+
+Step 1 — ANALYZE (fast, cheap, called often)
+  Claude calls `analyze_trajectory(goals, trajectory_so_far)`.
+  The MCP server asks the Claude API: "Is there a missing tool here, and
+  are you confident enough to build it?"
+  Returns: { "tool_needed": false } in most cases, OR a high-confidence
+  structured spec if a gap is found.
+
+Step 2 — DEVELOP (only when Step 1 says yes)
+  Claude calls `develop_tool(spec)`.
+  The MCP server generates working Python code for the tool, writes it to
+  a tools/ directory, imports it, and calls FastMCP's add_tool() to register
+  it into the running server at runtime.
+  It then sends a MCP `notifications/tools/list_changed` notification.
+
+Step 3 — USE (Claude Code re-lists tools automatically)
+  Claude Code receives the notification, re-fetches the tool list, and
+  discovers the new tool. Claude can now call it in the same session.
+
+The loop is intentionally broken into two tool calls so Claude can inspect
+the spec before committing to development. If the spec looks wrong, Claude
+can abort before Step 2.
+
+
+3. TRIGGER MODES
+--------------------------------------------------------------------------------
+
+Mode A — Reactive (recommended default)
+  Claude calls analyze_trajectory when it notices it is stuck:
+  - Same logical operation repeated 3+ times
+  - A Bash command that is doing something semantically rich (complex
+    pipeline, external API call, multi-step parse)
+  - Explicit awareness: "I wish I could do X directly"
+  - A task that required human confirmation because no safe programmatic
+    path existed
+
+  This is the preferred mode. It places the judgment call on Claude, which
+  has full context on whether it is stuck.
+
+Mode B — Periodic (optional, configured by user)
+  A hook fires analyze_trajectory every N tool calls (e.g., every 20).
+  This catches friction Claude didn't consciously notice.
+  Risk: adds latency and token cost to every session. Use conservatively.
+
+Mode C — On-demand (always available)
+  User explicitly asks: "Check if any tools are missing based on what
+  you've been doing." Claude calls analyze_trajectory with full context.
+
+
+4. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+4.1 Project Structure
+
+  meta_tools/
+  ├── server.py                  # FastMCP server, exposes analyze + develop
+  ├── analyzer.py                # Calls Claude API, returns gap analysis
+  ├── developer.py               # Generates tool code, registers it live
+  ├── registry.py                # Manages the dynamic tool directory
+  ├── schemas.py                 # Pydantic models for all inputs/outputs
+  ├── prompt_templates.py        # System + user prompts for the analyzer
+  ├── config.py                  # Model, confidence threshold, paths
+  └── generated_tools/           # Written by developer.py at runtime
+      ├── __init__.py
+      └── <tool_name>.py         # Each generated tool is one file
+
+  tests/
+  ├── test_analyzer.py
+  ├── test_developer.py
+  ├── test_registry.py
+  └── fixtures/
+      ├── trajectories/          # Sample trajectories (positive + negative)
+      └── expected_specs/        # Golden output for positive cases
+
+  pyproject.toml
+  .env.example
+  README.md
+
+4.2 MCP Transport
+
+  stdio transport (standard for Claude Code). The server is launched as a
+  subprocess by Claude Code. It stays alive for the session, accumulating
+  generated tools in memory and on disk.
+
+4.3 Dependencies
+
+  fastmcp >= 2.0         # MCP server + runtime add_tool() support
+  anthropic >= 0.40      # Claude API SDK (with prompt caching)
+  pydantic >= 2.0        # Schema validation
+  python-dotenv          # Env config
+  black                  # Auto-format generated code before import
+
+
+5. MCP TOOLS EXPOSED
+--------------------------------------------------------------------------------
+
+5.1  analyze_trajectory
+
+  Purpose: Determine whether a missing tool would meaningfully help right now.
+           Default answer is NO. Only returns a spec when confidence is high.
+
+  Input:
+    {
+      "goals": "string — what Claude is trying to accomplish overall",
+      "trajectory": "string — the steps taken so far, including workarounds,
+                     failed attempts, and things Claude wished it could do",
+      "available_tools": ["array of tool names Claude already has"]
+    }
+
+  Output (no gap found — the common case):
+    {
+      "tool_needed": false,
+      "reason": "string — brief explanation of why existing tools suffice"
+    }
+
+  Output (gap found):
+    {
+      "tool_needed": true,
+      "confidence": 0.0–1.0,        // only returned if >= threshold (0.85)
+      "spec": {
+        "name": "snake_case_name",
+        "one_liner": "string",
+        "rationale": "string — specific friction this removes",
+        "input_schema": { ... },     // full JSON Schema
+        "output_description": "string",
+        "implementation_approach": "string — how to implement it",
+        "effort_estimate": "low | medium | high"
+      }
+    }
+
+  Notes:
+  - confidence < 0.85 → tool_needed = false (threshold configurable)
+  - The prompt explicitly instructs the model to be skeptical and return
+    false unless the case is clear and specific
+
+5.2  develop_tool
+
+  Purpose: Given a validated spec, generate and live-register the tool.
+
+  Input:
+    {
+      "spec": { ... }    // the spec object from analyze_trajectory output
+    }
+
+  Output:
+    {
+      "success": true,
+      "tool_name": "string",
+      "file_path": "string — where the code was written",
+      "registered": true,
+      "message": "Tool is now available. Claude Code will update its tool
+                  list automatically via the tools/list_changed notification."
+    }
+
+  What happens internally:
+    1. developer.py calls Claude API to generate tool implementation code
+    2. Code is written to generated_tools/<name>.py
+    3. Code is auto-formatted with black
+    4. Module is dynamically imported
+    5. Tool function is extracted and passed to mcp.add_tool()
+    6. Server sends notifications/tools/list_changed to Claude Code
+    7. Claude Code re-fetches the tool list; new tool is available
+
+
+6. CONFIDENCE THRESHOLD & CONSERVATISM
+--------------------------------------------------------------------------------
+
+The confidence threshold is the most important tunable in the system.
+
+Default: 0.85
+
+The system prompt for the analyzer instructs the model to:
+  - Return false if the task can be done with existing tools in ≤ 3 steps
+  - Return false if the need is one-off and unlikely to recur
+  - Return false if the "tool" would just be a thin wrapper around Bash
+  - Return false if the trajectory shows friction, but not a systematic gap
+  - Only return true if:
+      (a) The same logical sub-operation recurred 3+ times already, OR
+      (b) The operation is clearly a standard action in the problem domain
+          that the toolset should support, OR
+      (c) The workaround required is genuinely unsafe or unreliable
+
+This conservatism prevents tool sprawl. A session should end with 0 or 1
+new tools — not 5.
+
+The threshold is configurable in config.py. Users who want more aggressive
+suggestions can lower it; production use should keep it at 0.85+.
+
+
+7. TOOL CODE GENERATION
+--------------------------------------------------------------------------------
+
+7.1 What gets generated
+
+  Each generated tool is a self-contained Python file:
+
+    # generated_tools/git_conflict_resolver.py
+    import subprocess
+    from typing import Literal
+
+    def git_conflict_resolver(
+        file_paths: list[str],
+        strategy: Literal["ours", "theirs"]
+    ) -> dict:
+        """Resolve merge conflicts in the given files using a specified strategy."""
+        results = []
+        for path in file_paths:
+            result = subprocess.run(
+                ["git", "checkout", f"--{strategy}", path],
+                capture_output=True, text=True
+            )
+            results.append({"file": path, "success": result.returncode == 0})
+        return {"resolved": results}
+
+  The file contains exactly one public function with the tool name.
+  FastMCP introspects the function signature and docstring to register it.
+
+7.2 Code generation prompt
+
+  The developer prompt instructs Claude to:
+  - Write only the implementation function + necessary imports
+  - Use stdlib and already-installed packages where possible
+  - No classes, no helpers, no abstraction beyond what's needed
+  - The function must be safe: no shell injection, validate inputs
+  - Include a one-line docstring (used as the MCP tool description)
+  - Return a dict (MCP tools return serializable objects)
+
+7.3 Safety gate before registration
+
+  Before importing and registering, the server:
+  - Checks the file compiles (py_compile.compile)
+  - Checks the function signature matches the spec's input_schema
+  - Rejects if the code calls os.system() or uses shell=True with user input
+  - (Future) Runs in a subprocess sandbox first to check for crashes
+
+
+8. DYNAMIC REGISTRATION MECHANISM
+--------------------------------------------------------------------------------
+
+FastMCP 2.0 supports mcp.add_tool(fn, name, description) at runtime.
+After add_tool() is called, the server sends a JSON-RPC notification:
+
+  {
+    "jsonrpc": "2.0",
+    "method": "notifications/tools/list_changed"
+  }
+
+Claude Code handles this notification by re-issuing a tools/list request.
+The response now includes the new tool. Claude sees it and can call it.
+
+This means the new tool is available without:
+  - Restarting Claude Code
+  - Restarting the MCP server
+  - Any user action
+
+The generated_tools/ directory is also persisted on disk, so tools survive
+server restarts and are available in future sessions.
+
+
+9. CLAUDE CODE INTEGRATION
+--------------------------------------------------------------------------------
+
+9.1 MCP Server Registration (~/.claude/settings.json)
+
+  {
+    "mcpServers": {
+      "meta-tools": {
+        "type": "stdio",
+        "command": "python",
+        "args": ["-m", "meta_tools.server"],
+        "cwd": "/path/to/meta-tools",
+        "env": {
+          "ANTHROPIC_API_KEY": "<key>"
+        }
+      }
+    }
+  }
+
+9.2 Suggested Usage Instructions (in CLAUDE.md or system prompt)
+
+  "You have access to two meta-tools: analyze_trajectory and develop_tool.
+   Call analyze_trajectory when you find yourself repeating the same
+   multi-step workaround more than twice, or when you realize there is
+   something you cannot do directly that you clearly should be able to.
+   If analyze_trajectory returns tool_needed=true, review the spec,
+   then call develop_tool to build and register it."
+
+9.3 Periodic Hook (optional, Phase 3)
+
+  A PostToolUse hook that increments a counter and fires analyze_trajectory
+  every 20 tool calls. Configured in settings.json hooks.
+
+
+10. DEVELOPMENT PHASES
+--------------------------------------------------------------------------------
+
+Phase 1 — Analyzer MVP
+  [ ] Project scaffold: pyproject.toml, folder structure, .env.example
+  [ ] Pydantic schemas (AnalysisInput, AnalysisOutput, ToolSpec)
+  [ ] System prompt for the analyzer (conservative, skeptical framing)
+  [ ] Claude API call with prompt caching on system prompt
+  [ ] Confidence threshold enforcement
+  [ ] FastMCP server exposing analyze_trajectory
+  [ ] Manual tests with 5 trajectory fixtures (3 negative, 2 positive)
+
+Phase 2 — Developer + Dynamic Registration
+  [x] Code generation prompt for developer.py
+  [x] File write (black formatting deferred — output is already clean)
+  [x] Safety gate (AST parse + dangerous-pattern scan; verified across 5 cases)
+  [x] FastMCP add_tool() + tools/list_changed (FastMCP emits automatically)
+  [x] develop_tool MCP endpoint with live registration (idempotent)
+  [x] Startup loader: existing generated_tools/*.py loaded on server boot
+  [ ] End-to-end test against the API (needs ANTHROPIC_API_KEY in .env)
+
+Phase 3 — Robustness
+  [ ] Unit tests for all modules
+  [ ] Error handling: API failures, bad generated code, import errors
+  [ ] Retry + fallback for code generation (if first attempt fails safety gate)
+  [ ] Persistence: load generated_tools/ on server startup
+  [ ] Config file support (threshold, model, max_tools_per_session)
+
+Phase 4 — Automation
+  [ ] PostToolUse hook for periodic analysis (every N calls)
+  [ ] Tool usage logging: track which generated tools actually get called
+  [ ] Pruning: generated tools not called in K sessions get archived
+  [ ] Optional: push new tool specs to a GitHub repo as PRs
+
+
+11. KEY DESIGN DECISIONS
+--------------------------------------------------------------------------------
+
+11.1 Two separate tools, not one
+  analyze_trajectory and develop_tool are separate so Claude can inspect
+  the spec before committing to building. This is a deliberate checkpoint.
+  The user (or Claude) can veto the spec before any code is written.
+
+11.2 Conservative by default, not creative
+  The analyzer is not a brainstorming assistant. It is a gap detector with
+  a high bar. This prevents the system from becoming a toy that generates
+  marginally useful tools constantly.
+
+11.3 Generated tools are first-class
+  Tools written by develop_tool live in generated_tools/ and are loaded on
+  server startup. They are not temporary. They persist and grow the toolset
+  over time, forming a library of session-specific extensions.
+
+11.4 No sandbox escape
+  Generated tools run in the same process as the MCP server. The safety gate
+  prevents the most obvious abuses (shell injection) but this is not a
+  full sandbox. The model is trusted to generate reasonable code. In a
+  production setting, add subprocess isolation.
+
+11.5 Prompt caching on both prompts
+  The analyzer system prompt is large and static → cache_control: ephemeral.
+  The developer system prompt is also static → same.
+  Only the user-injected trajectory and spec change per call.
+
+
+12. EXAMPLE END-TO-END SESSION
+--------------------------------------------------------------------------------
+
+Context: Claude is auditing a FastAPI codebase for route auth coverage.
+
+--- Claude's internal state after 15 tool calls ---
+"I've now called Bash 6 times to grep for route decorators, Read 7 times
+to inspect files, and I'm manually building a table. I keep missing routes
+in nested APIRouters. I'm going to call analyze_trajectory."
+
+--- Call: analyze_trajectory ---
+  goals: "Audit all FastAPI routes and their auth dependencies"
+  trajectory: "Grepped for @app.get/post/etc 3 times with different
+               patterns, missing nested routers each time. Read 7 files.
+               Building a table manually. Operation repeated 3 times with
+               imperfect results."
+  available_tools: ["Bash", "Read", "Edit", "Write", "WebSearch"]
+
+--- Response ---
+  {
+    "tool_needed": true,
+    "confidence": 0.91,
+    "spec": {
+      "name": "fastapi_route_extractor",
+      "one_liner": "Extract all routes from a FastAPI project, including nested routers",
+      "rationale": "Claude has attempted this operation 3 times with Bash grep,
+                    each time missing nested APIRouter includes. A dedicated
+                    tool using AST parsing would handle all nesting correctly.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project_root": { "type": "string" },
+          "include_auth_info": { "type": "boolean", "default": true }
+        },
+        "required": ["project_root"]
+      },
+      "output_description": "List of routes with method, path, file, line, and detected auth deps",
+      "implementation_approach": "Walk .py files, use ast.parse to find APIRouter
+                                   and app decorator calls, resolve includes recursively.",
+      "effort_estimate": "medium"
+    }
+  }
+
+--- Claude inspects spec, decides to proceed ---
+
+--- Call: develop_tool({ spec: <above> }) ---
+  → Code generated, written to generated_tools/fastapi_route_extractor.py
+  → Safety gate passes
+  → mcp.add_tool() called
+  → notifications/tools/list_changed sent
+  → Claude Code re-lists tools
+  → fastapi_route_extractor now appears in Claude's tool list
+
+--- Claude calls fastapi_route_extractor(project_root="./src") ---
+  → Returns complete route list in one call
+  → Audit completes in 2 more steps instead of 20
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+PHASE 5 — TOOL SHELF MANAGEMENT
+================================================================================
+
+13. MOTIVATION
+--------------------------------------------------------------------------------
+Phases 1–4 produce a system that grows the toolset. Left unchecked, this hits
+a ceiling: Claude Code's context degrades when too many tools are exposed at
+once (each tool's name, description, and schema is loaded on every request).
+A project that develops 50, 100, or 500 tools cannot keep them all live.
+
+Phase 5 separates "tools that exist" from "tools currently exposed":
+
+  - LONG-TERM MEMORY (the registry): every tool ever developed, stored on
+    disk with full metadata. Cheap. Unbounded.
+
+  - SHORT-TERM MEMORY (the shelf): the bounded subset currently registered
+    with FastMCP and visible to Claude. Default ceiling: 20 tools.
+
+  - A meta-tool, `find_and_load_tool`, lets Claude search the registry, pull
+    in a relevant tool, and evict another to make room — all live, in
+    session, via the same `tools/list_changed` mechanism Phase 2 introduced.
+
+This turns the toolset into a working set. Claude only ever sees a small
+relevant slice, but can reach into a large library on demand.
+
+
+14. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ LONG-TERM REGISTRY  (registry.jsonl on disk)             │
+  │                                                          │
+  │ One row per tool, ever:                                  │
+  │   { name, description, input_schema, file_path,          │
+  │     pinned, tags, created_at, last_used, usage_count }   │
+  │                                                          │
+  │ Read on every find_and_load_tool call.                   │
+  │ Written when develop_tool produces a new tool.           │
+  └──────────────────────────────────────────────────────────┘
+                              │
+                              │ load on demand
+                              ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ SHORT-TERM SHELF  (live in FastMCP, ≤ N tools)           │
+  │                                                          │
+  │ ┌────────────────┬──────────────────────────────────┐    │
+  │ │ Pinned slots   │  analyze_trajectory              │    │
+  │ │ (always live)  │  develop_tool                    │    │
+  │ │                │  find_and_load_tool              │    │
+  │ │                │  unload_tool                     │    │
+  │ │                │  + user-pinned project tools     │    │
+  │ ├────────────────┼──────────────────────────────────┤    │
+  │ │ Working slots  │  recently used / loaded tools    │    │
+  │ │ (LRU-evicted)  │  fastapi_route_extractor         │    │
+  │ │                │  git_conflict_resolver           │    │
+  │ │                │  ...                             │    │
+  │ └────────────────┴──────────────────────────────────┘    │
+  └──────────────────────────────────────────────────────────┘
+
+The four meta-tools (analyze, develop, find_and_load, unload) are always
+pinned. They are the entry points — without them, Claude cannot manage its
+own shelf, so they cannot be evicted.
+
+
+15. THE REGISTRY
+--------------------------------------------------------------------------------
+
+15.1 Storage
+
+  registry.jsonl — append-mostly, one JSON object per line:
+
+    {
+      "name": "fastapi_route_extractor",
+      "description": "Extract all routes from a FastAPI project, including
+                      nested APIRouters",
+      "input_schema": { ... },
+      "file_path": "generated_tools/fastapi_route_extractor.py",
+      "pinned": false,
+      "tags": ["python", "fastapi", "static-analysis"],
+      "created_at": "2026-05-04T12:34:56Z",
+      "last_used": "2026-05-04T13:01:22Z",
+      "usage_count": 3
+    }
+
+  JSONL is chosen over SQLite for simplicity and inspectability — a user can
+  open and edit the file directly. Migration to SQLite is straightforward if
+  scale demands it (Phase 6+).
+
+15.2 Operations
+
+  registry.list()                 → all entries
+  registry.get(name)              → one entry or None
+  registry.add(entry)             → append; called by develop_tool
+  registry.update_usage(name)     → bump last_used + usage_count
+  registry.search(query, limit)   → semantic-ish search (Phase 5.3)
+
+
+16. THE SHELF
+--------------------------------------------------------------------------------
+
+16.1 Bounded size
+
+  Configurable via SHELF_MAX_TOOLS (default: 20). Pinned tools count toward
+  the cap but cannot be evicted, so working capacity = SHELF_MAX_TOOLS -
+  pinned_count.
+
+16.2 Pinning
+
+  A tool is pinned when its registry entry has `pinned: true`. The four
+  meta-tools are pinned by default. Users can pin project-critical tools
+  by editing the registry or via a future `pin_tool` admin command.
+
+16.3 Eviction policy
+
+  When loading a new tool would exceed the cap:
+    1. Filter to non-pinned tools currently on the shelf
+    2. Sort by last_used ascending
+    3. Evict the oldest
+
+  Future: weighted by relevance to current goal (Phase 6).
+
+16.4 Persistence
+
+  shelf_state.json on disk: list of currently-loaded tool names. Written
+  after every load/unload. On server startup, restore the previous shelf
+  (minus pinned tools, which are loaded unconditionally).
+
+  This means a session resumes with the same working set Claude was using
+  before the restart.
+
+
+17. NEW META-TOOLS
+--------------------------------------------------------------------------------
+
+17.1 find_and_load_tool
+
+  Purpose: Search the registry for a tool relevant to the current task,
+           load it onto the shelf, evict an LRU tool if needed.
+
+  Input:
+    {
+      "query": "string — what Claude is trying to do, in natural language",
+      "max_candidates": "int — how many top matches to consider, default 5"
+    }
+
+  What it does:
+    1. Reads the registry, excludes tools already on the shelf
+    2. Calls Claude API: "Given this query and these candidate tool
+       descriptions, which is most likely to help? Or none?"
+    3. If a clear match (confidence ≥ threshold):
+       - Imports the tool's file
+       - Calls FastMCP add_tool()
+       - Evicts an LRU non-pinned tool if shelf is full (calls remove_tool)
+       - Sends notifications/tools/list_changed
+       - Updates registry: bumps last_used
+    4. Returns: { loaded: true, tool_name, evicted: <name or null> }
+       or:      { loaded: false, reason: "no relevant tool found" }
+
+  Like analyze_trajectory, this is conservative — return "no match" rather
+  than load a marginally-relevant tool that pollutes the shelf.
+
+17.2 unload_tool
+
+  Purpose: Manual eviction. Lets Claude (or the user) clear shelf space
+           or remove a tool that's distracting.
+
+  Input:
+    { "name": "string — tool to unload" }
+
+  Behavior:
+    - Refuses if the tool is pinned
+    - Calls FastMCP remove_tool()
+    - Sends notifications/tools/list_changed
+    - Tool remains in the registry (only removed from the shelf)
+
+
+18. INTEGRATION WITH PHASES 1–4
+--------------------------------------------------------------------------------
+
+  develop_tool (Phase 2) gains one extra step:
+    1. Generate code (existing)
+    2. Write to disk (existing)
+    3. Safety gate (existing)
+    4. NEW: append entry to registry.jsonl
+    5. NEW: if shelf is full, evict an LRU tool
+    6. add_tool() to FastMCP (existing)
+    7. notifications/tools/list_changed (existing)
+
+  So every newly developed tool lands in both the registry and the shelf.
+  Subsequent sessions can find it via find_and_load_tool even if it was
+  evicted from the shelf in the meantime.
+
+  analyze_trajectory's prompt should also be updated to be aware of the
+  registry: when proposing a tool, it should first hint that Claude might
+  want to call find_and_load_tool to check whether something similar
+  already exists.
+
+
+19. RETRIEVAL — LLM-FIRST, EMBEDDINGS LATER
+--------------------------------------------------------------------------------
+
+19.1 v0 retrieval (Phase 5)
+
+  All-tool descriptions are sent to Claude API as part of the
+  find_and_load_tool prompt. The model picks the best match or "none".
+
+  Pros: zero infrastructure, high quality matches, easy to debug.
+  Cons: token cost grows linearly with registry size. Workable to ~100 tools.
+
+19.2 v1 retrieval (Phase 6, optional)
+
+  Switch to embeddings:
+    - Compute a tool-description embedding when entering registry
+    - On query, embed the query and do cosine top-K
+    - Send only top-K candidates to Claude for final selection
+
+  Pros: scales to thousands of tools, cheap per call.
+  Cons: requires an embedding pipeline + persistent vector index.
+
+  Phase 5 ships the LLM-first version. Phase 6 is the upgrade.
+
+
+20. PHASE 5 TASK BREAKDOWN
+--------------------------------------------------------------------------------
+
+  5.1 Registry
+    [ ] Define ToolRegistryEntry pydantic schema
+    [ ] registry.py: read, append, get, update_usage
+    [ ] Write registry.jsonl atomically (tmp file + rename)
+
+  5.2 Shelf manager
+    [ ] shelf.py: in-memory shelf state with bounded size + pinning
+    [ ] LRU eviction
+    [ ] Persistence to shelf_state.json
+    [ ] Restore shelf on server startup (load pinned + last-active)
+
+  5.3 find_and_load_tool meta-tool
+    [ ] Prompt template: candidate selection with conservatism
+    [ ] LLM-based retrieval (send all non-shelf tool descriptions)
+    [ ] Hot-load via FastMCP add_tool() + list_changed notification
+    [ ] Update registry usage stats
+
+  5.4 unload_tool meta-tool
+    [ ] Pinned-tool guard
+    [ ] FastMCP remove_tool() + list_changed notification
+
+  5.5 Integration
+    [ ] develop_tool writes to registry before add_tool
+    [ ] develop_tool triggers eviction if shelf full
+    [ ] analyze_trajectory prompt mentions registry-first lookup
+
+  5.6 Tests
+    [ ] Registry CRUD round-trip
+    [ ] Shelf bounds + LRU eviction + pin protection
+    [ ] find_and_load_tool: hit / miss / shelf-full eviction paths
+    [ ] End-to-end: develop a tool → restart server → find_and_load it back
+
+
+21. KEY DESIGN DECISIONS (Phase 5)
+--------------------------------------------------------------------------------
+
+21.1 Why a separate find_and_load_tool, not auto-load on demand?
+  Auto-loading every potentially relevant tool would defeat the purpose —
+  the shelf would fill with speculative loads. Making Claude explicitly call
+  find_and_load_tool keeps the swap intentional and observable.
+
+21.2 Why JSONL for the registry?
+  Human-readable, append-only, no migrations, trivial to inspect or hand-edit.
+  Premature optimization to switch to SQLite when read volume is low.
+
+21.3 Why pin the meta-tools?
+  If find_and_load_tool itself were evicted, Claude would have no way to get
+  it back without a server restart. The four meta-tools are the bootloader;
+  they must always be present.
+
+21.4 Why does unload_tool keep the tool in the registry?
+  Unloading is reversible by find_and_load_tool. Removing from the registry
+  would mean re-developing the tool, which loses the prior implementation
+  and its usage history.
+
+21.5 Why is the shelf size 20?
+  A guess based on what feels manageable in a tool list. Should be
+  configurable per project. Larger projects with stable tool sets may want 50+;
+  exploratory projects may want 10.
+
+
+22. EXAMPLE FLOW (Phase 5)
+--------------------------------------------------------------------------------
+
+Context: A project has 47 tools in the registry, 18 currently on the shelf
+(4 pinned meta-tools + 14 working tools). Claude is starting a new task.
+
+Claude: "I need to extract routes from a FastAPI project."
+        (recognizes this is in the project's domain, calls find_and_load_tool)
+
+Call: find_and_load_tool(query="extract FastAPI routes including nested routers")
+
+Server:
+  - Reads registry (47 entries)
+  - Filters out the 18 already on shelf → 29 candidates
+  - Sends all 29 descriptions to Claude API with the query
+  - Model returns: "fastapi_route_extractor" (high relevance)
+  - Shelf is at 18/20, room for one more — no eviction needed
+  - Imports the tool, add_tool(), sends list_changed
+
+Response: { loaded: true, tool_name: "fastapi_route_extractor", evicted: null }
+
+Claude Code re-lists tools, sees fastapi_route_extractor, calls it.
+
+================================================================================
+END OF PLAN
+================================================================================

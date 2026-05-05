@@ -1,0 +1,9 @@
+{
+  "description": "Negative case: friction occurred once, clearly one-off",
+  "input": {
+    "goals": "Convert a one-time CSV export from a legacy system into a JSON format for import.",
+    "trajectory": "1. Read the CSV file.\n2. Wrote a short Python script with Bash to parse the specific column layout.\n3. Saved the output as JSON.\n4. Done — this file format will never appear again.",
+    "available_tools": ["Bash", "Read", "Write", "Edit"]
+  },
+  "expected_tool_needed": false
+}

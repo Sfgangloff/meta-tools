@@ -1,0 +1,9 @@
+{
+  "description": "Positive case: repeated failed attempts to extract FastAPI routes with grep",
+  "input": {
+    "goals": "Audit all API endpoints in a FastAPI codebase and generate a summary with auth requirements per route.",
+    "trajectory": "1. Used Bash grep to find @app.get/@app.post patterns — got 23 results.\n2. Read each of those files to check for auth dependencies — found some routes missing.\n3. Realized I missed routes defined in nested APIRouter includes. Ran grep again with different patterns.\n4. Got more results but still inconsistent — some routers imported from other modules weren't found.\n5. Manually read 12 more files trying to trace APIRouter imports.\n6. Repeated the grep with yet another pattern to catch @router.get/@router.post.\n7. Still missing routes from a sub-package that re-exports a router.\n8. Total: 6 Bash grep calls, 19 Read calls, still not confident I have the full list.\n9. Resorted to building the table manually from what I found, knowing it may be incomplete.",
+    "available_tools": ["Bash", "Read", "Edit", "Write", "WebSearch"]
+  },
+  "expected_tool_needed": true
+}

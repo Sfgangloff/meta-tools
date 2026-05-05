@@ -1,0 +1,9 @@
+{
+  "description": "Negative case: task completed with existing tools, no real gap",
+  "input": {
+    "goals": "Find all Python files in a project that import a specific module and list them.",
+    "trajectory": "1. Used Bash with grep -r to find files importing the module.\n2. Got a list of matches.\n3. Done.",
+    "available_tools": ["Bash", "Read", "Edit"]
+  },
+  "expected_tool_needed": false
+}
