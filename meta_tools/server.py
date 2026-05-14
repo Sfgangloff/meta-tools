@@ -6,19 +6,22 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from .analyzer import analyze
+from .suggester import suggest
 from .developer import develop, GENERATED_DIR
-from .schemas import AnalysisInput, ToolSpec
+from .schemas import AnalysisInput, SuggestionsInput, ToolSpec
 
 mcp = FastMCP(
     name="meta-tools",
     instructions=(
-        "Two meta-tools for self-extension. "
-        "Call analyze_trajectory when you notice you are repeating the same multi-step "
-        "workaround 3 or more times — it returns 'no tool needed' in most cases, and a "
-        "spec only when confidence is high. "
-        "If a spec is returned, review it, then call develop_tool with the spec to "
-        "generate the implementation. The new tool is written to disk and becomes "
-        "available on the next MCP server restart."
+        "Meta-tools for self-extension. Three entry points:\n"
+        "- suggest_tools: lightweight advisor — given the current goals and trajectory, "
+        "returns up to 3 ranked tool suggestions (or none). Call whenever you suspect a "
+        "missing tool would help; you decide whether to build any of them.\n"
+        "- analyze_trajectory: strict, gated detector — returns a single spec only when "
+        "confidence is very high. Useful when you want the model to commit to a single "
+        "auto-build candidate. Most of the time, suggest_tools is the better entry point.\n"
+        "- develop_tool: takes a spec (from either tool above, or hand-written) and "
+        "generates + live-registers the implementation."
     ),
 )
 
@@ -35,6 +38,29 @@ def analyze_trajectory(
     """
     result = analyze(
         AnalysisInput(
+            goals=goals,
+            trajectory=trajectory,
+            available_tools=available_tools or [],
+        )
+    )
+    return result.model_dump()
+
+
+@mcp.tool()
+def suggest_tools(
+    goals: str,
+    trajectory: str,
+    available_tools: list[str] | None = None,
+) -> dict:
+    """
+    Suggest up to 3 tools that, if added, would help the agent for the given goals and
+    trajectory. Returns a list of ranked suggestions — each with a full spec body
+    suitable for passing directly to develop_tool — or an empty list with notes when
+    nothing useful comes to mind. No confidence gating: the caller decides what (if
+    anything) to build.
+    """
+    result = suggest(
+        SuggestionsInput(
             goals=goals,
             trajectory=trajectory,
             available_tools=available_tools or [],

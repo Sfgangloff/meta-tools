@@ -1,5 +1,5 @@
 import json
-from .schemas import AnalysisInput, ToolSpec
+from .schemas import AnalysisInput, SuggestionsInput, ToolSpec
 
 SYSTEM_PROMPT = """You are a tool gap detector for AI coding assistants. Your job is to analyze \
 a reasoning trajectory — the sequence of steps an AI agent took while working toward a goal — \
@@ -88,6 +88,73 @@ def build_user_prompt(data: AnalysisInput) -> str:
 
 Analyze this trajectory. Is there a missing tool? Remember: default to NO unless the evidence is \
 clear, specific, and recurring."""
+
+
+SUGGESTER_SYSTEM_PROMPT = """You are a tool-design advisor for AI coding assistants. Given a \
+reasoning trajectory and the agent's current toolset, you nominate up to 3 plausible tools that, \
+if added, would help the agent — either to make the current task easier or to handle the class of \
+tasks the trajectory exemplifies.
+
+## Your role
+
+You are an advisor, not a gatekeeper. You return concrete suggestions whenever you can identify a \
+real-shaped gap, including speculative ones — the caller (Claude Code) decides which, if any, to \
+build. You are NOT a skeptical auditor; the "nothing needed" path exists, but it is not your \
+default.
+
+That said, suggestions must be honest. Don't pad the list. Don't propose tools that wrap a single \
+Bash call, duplicate an existing tool's job, or solve a problem the agent didn't actually have. \
+If after careful reading you genuinely see no useful tool to propose, return an empty list with a \
+short `notes` explaining why.
+
+## What makes a good suggestion
+
+Each suggestion must:
+- Address a specific operation visible in the trajectory or implied by the goal, not a generic capability
+- Be implementable as a single Python function (no long-running services, no stateful databases)
+- Have a snake_case `name` that names the operation precisely (e.g. `extract_fastapi_routes`, \
+not `code_analyzer`)
+- Include a valid JSON Schema `input_schema` with `type: object`, `properties`, and `required`
+- Include a concrete `implementation_approach` — what library or technique to use
+
+## Priority
+
+Set `priority` per suggestion:
+- **high**: clear, recurring friction in the trajectory that this tool would directly eliminate
+- **medium**: plausible win, but the trajectory doesn't strongly demand it
+- **low**: speculative — useful for the class of task but not clearly load-bearing for this session
+
+Set `would_use_now: true` only if the suggested tool, were it already loaded, would plausibly be \
+called as the agent's very next action given the current trajectory state.
+
+## Output
+
+Call the `report_suggestions` tool. Return 0–3 suggestions, ordered by priority (high first). \
+Populate `notes` with a brief comment when the list is empty or surprising in some way."""
+
+
+def build_suggester_user_prompt(data: SuggestionsInput) -> str:
+    tools_section = (
+        "\n".join(f"  - {t}" for t in data.available_tools)
+        if data.available_tools
+        else "  (none specified)"
+    )
+    return f"""## Session Goals
+
+{data.goals}
+
+## Reasoning Trajectory
+
+{data.trajectory}
+
+## Available Tools
+
+{tools_section}
+
+---
+
+Suggest up to 3 tools that would help. Be specific. If nothing useful comes to mind, return an \
+empty list with a short note."""
 
 
 DEVELOPER_SYSTEM_PROMPT = """You are a Python implementer for MCP tools. You receive a tool \

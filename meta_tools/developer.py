@@ -2,13 +2,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import anthropic
-
 from .schemas import ToolSpec, DevelopmentResult
-from .config import ANTHROPIC_API_KEY, ANALYZER_MODEL, MAX_TOKENS
 from .prompt_templates import DEVELOPER_SYSTEM_PROMPT, build_developer_prompt
-
-_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+from .cli import complete_text
 
 GENERATED_DIR: Path = Path(__file__).parent.parent / "generated_tools"
 
@@ -52,20 +48,10 @@ def develop(spec: ToolSpec) -> DevelopmentResult:
 
 
 def _generate_code(spec: ToolSpec) -> str:
-    response = _client.messages.create(
-        model=ANALYZER_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": DEVELOPER_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": build_developer_prompt(spec)}],
+    text = complete_text(
+        system_prompt=DEVELOPER_SYSTEM_PROMPT,
+        user_prompt=build_developer_prompt(spec),
     )
-
-    text = response.content[0].text
 
     # Defensive: strip markdown fences if the model added them despite instructions
     if "```python" in text:
